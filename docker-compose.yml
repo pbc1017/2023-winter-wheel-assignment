@@ -1,2 +1,106 @@
-# Write docker-compose file here
-# For instructions, see https://github.com/SnowSuno/wheel-assignment-solution#2-docker-composeyml-%EC%9E%91%EC%84%B1
+version: "3.8"
+
+services:
+  # MongoDB Database
+  mongodb:
+    image: mongo:5.0
+    container_name: taxi-mongodb
+    restart: unless-stopped
+    environment:
+      MONGO_INITDB_DATABASE: taxi
+    volumes:
+      - mongodb_data:/data/db
+    ports:
+      - "27017:27017"
+    networks:
+      - taxi-network
+    healthcheck:
+      test: echo 'db.runCommand("ping").ok' | mongosh localhost:27017/taxi --quiet
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  # Backend Server
+  server:
+    build:
+      context: ./server
+      dockerfile: Dockerfile
+    container_name: taxi-server
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      PORT: 80
+      DB_PATH: mongodb://mongodb:27017/taxi
+      SESSION_KEY: ${SESSION_KEY:-TAXI_SESSION_KEY}
+      SPARCSSSO_CLIENT_ID: ${SPARCSSSO_CLIENT_ID}
+      SPARCSSSO_CLIENT_KEY: ${SPARCSSSO_CLIENT_KEY}
+      FRONT_URL: ${FRONT_URL:-http://localhost}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+      AWS_S3_BUCKET_NAME: ${AWS_S3_BUCKET_NAME}
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY}
+      APP_URI_SCHEME: ${APP_URI_SCHEME}
+    depends_on:
+      mongodb:
+        condition: service_healthy
+    networks:
+      - taxi-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:80/docs"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  # Frontend Client
+  client:
+    build:
+      context: ./client
+      dockerfile: Dockerfile
+      args:
+        REACT_APP_BACK_URL: ${REACT_APP_BACK_URL:-http://localhost/api}
+        REACT_APP_S3_URL: ${REACT_APP_S3_URL}
+        REACT_APP_CHANNELTALK_PLUGIN_KEY: ${REACT_APP_CHANNELTALK_PLUGIN_KEY}
+        REACT_APP_GA_TRACKING_ID: ${REACT_APP_GA_TRACKING_ID}
+    container_name: taxi-client
+    restart: unless-stopped
+    networks:
+      - taxi-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:80/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  # Nginx Reverse Proxy
+  nginx:
+    build:
+      context: ./nginx
+      dockerfile: Dockerfile
+    container_name: taxi-nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+    depends_on:
+      client:
+        condition: service_healthy
+      server:
+        condition: service_healthy
+    networks:
+      - taxi-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:80/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  mongodb_data:
+    driver: local
+
+networks:
+  taxi-network:
+    driver: bridge
