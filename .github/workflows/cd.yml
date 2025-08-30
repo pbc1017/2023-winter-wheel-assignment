@@ -1,2 +1,128 @@
-# Write github action workflow here
-# For instructions, see https://github.com/SnowSuno/wheel-assignment-solution#3-cicd-%ED%8C%8C%EC%9D%B4%ED%94%84%EB%9D%BC%EC%9D%B8-%EA%B5%AC%EC%84%B1
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+
+jobs:
+  build-and-push:
+    name: Build and Push Images
+    runs-on: ubuntu-latest
+    outputs:
+      image-tag: ${{ steps.vars.outputs.tag }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up variables
+        id: vars
+        run: |
+          echo "tag=${GITHUB_SHA::8}" >> $GITHUB_OUTPUT
+          echo "date=$(date +'%Y-%m-%d')" >> $GITHUB_OUTPUT
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Build and push client image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./client
+          file: ./client/Dockerfile
+          push: true
+          platforms: linux/amd64
+          tags: |
+            ${{ env.DOCKER_USERNAME }}/taxi-client:latest
+            ${{ env.DOCKER_USERNAME }}/taxi-client:${{ steps.vars.outputs.tag }}
+          build-args: |
+            REACT_APP_BACK_URL=${{ secrets.REACT_APP_BACK_URL }}
+            REACT_APP_S3_URL=${{ secrets.REACT_APP_S3_URL }}
+            REACT_APP_CHANNELTALK_PLUGIN_KEY=${{ secrets.REACT_APP_CHANNELTALK_PLUGIN_KEY }}
+            REACT_APP_GA_TRACKING_ID=${{ secrets.REACT_APP_GA_TRACKING_ID }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build and push server image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./server
+          file: ./server/Dockerfile
+          push: true
+          platforms: linux/amd64
+          tags: |
+            ${{ env.DOCKER_USERNAME }}/taxi-server:latest
+            ${{ env.DOCKER_USERNAME }}/taxi-server:${{ steps.vars.outputs.tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build and push nginx image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./nginx
+          file: ./nginx/Dockerfile
+          push: true
+          platforms: linux/amd64
+          tags: |
+            ${{ env.DOCKER_USERNAME }}/taxi-nginx:latest
+            ${{ env.DOCKER_USERNAME }}/taxi-nginx:${{ steps.vars.outputs.tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    name: Deploy to EC2
+    runs-on: ubuntu-latest
+    needs: build-and-push
+
+    steps:
+      - name: Deploy to EC2
+        uses: appleboy/ssh-action@v1.0.0
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          port: ${{ secrets.EC2_PORT || 22 }}
+          script: |
+            # Navigate to app directory
+            cd ~/taxi-app
+
+            # Set environment variables for docker-compose
+            export CLIENT_IMAGE=${{ secrets.DOCKER_USERNAME }}/taxi-client:${{ needs.build-and-push.outputs.image-tag }}
+            export SERVER_IMAGE=${{ secrets.DOCKER_USERNAME }}/taxi-server:${{ needs.build-and-push.outputs.image-tag }}
+            export NGINX_IMAGE=${{ secrets.DOCKER_USERNAME }}/taxi-nginx:${{ needs.build-and-push.outputs.image-tag }}
+
+            # Set server runtime environment variables
+            export SESSION_KEY="${{ secrets.SESSION_KEY }}"
+            export AWS_ACCESS_KEY_ID="${{ secrets.AWS_ACCESS_KEY_ID }}"
+            export AWS_SECRET_ACCESS_KEY="${{ secrets.AWS_SECRET_ACCESS_KEY }}"
+            export AWS_S3_BUCKET_NAME="${{ secrets.AWS_S3_BUCKET_NAME }}"
+            export SPARCSSSO_CLIENT_ID="${{ secrets.SPARCSSSO_CLIENT_ID }}"
+            export SPARCSSSO_CLIENT_KEY="${{ secrets.SPARCSSSO_CLIENT_KEY }}"
+            export FRONT_URL="${{ secrets.FRONT_URL }}"
+            export JWT_SECRET_KEY="${{ secrets.JWT_SECRET_KEY }}"
+            export APP_URI_SCHEME="${{ secrets.APP_URI_SCHEME }}"
+
+            # Pull new images
+            echo "Pulling new images..."
+            docker-compose pull
+
+            # Restart services with new images
+            echo "Restarting services..."
+            docker-compose up -d --no-build
+
+            # Clean up old images
+            echo "Cleaning up old images..."
+            docker image prune -f
+
+            # Show status
+            echo "Deployment completed!"
+            docker-compose ps
